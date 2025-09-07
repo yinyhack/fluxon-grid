@@ -181,6 +181,39 @@
     (/ (* base-amount reputation-score REPUTATION_REWARD_MULTIPLIER) u10000)
 )
 
+;; Calculate tessellation score for domain resilience
+(define-private (calculate-tessellation-score (verification-index uint) (skill-density uint) (historical-attestations uint))
+    (let ((base-score (+ verification-index skill-density)))
+        (+ base-score (/ historical-attestations u10))
+    )
+)
+
+;; Update verifier success rate
+(define-private (update-verifier-success-rate (verifier principal) (successful bool))
+    (match (map-get? certified-verifiers { verifier: verifier })
+        verifier-data 
+        (let (
+            (total-verifications (get total-verifications verifier-data))
+            (current-success-rate (get success-rate verifier-data))
+            (new-total (+ total-verifications u1))
+            (successful-count (if successful 
+                (+ (/ (* current-success-rate total-verifications) u100) u1)
+                (/ (* current-success-rate total-verifications) u100)
+            ))
+            (new-success-rate (/ (* successful-count u100) new-total))
+        )
+            (map-set certified-verifiers
+                { verifier: verifier }
+                (merge verifier-data {
+                    total-verifications: new-total,
+                    success-rate: new-success-rate
+                })
+            )
+        )
+        false
+    )
+)
+
 ;; Admin Functions
 (define-public (set-system-status (active bool))
     (begin
@@ -373,4 +406,167 @@
 
 (define-public (verify-reputation-attestation (attestation-id uint))
     (let (
-        (attestation (unwrap!
+        (attestation (unwrap! (map-get? reputation-attestations { attestation-id: attestation-id }) ERR_ATTESTATION_NOT_FOUND))
+        (profile-id (get profile-id attestation))
+        (verifier (get verifier attestation))
+        (reputation-score (get reputation-score attestation))
+        (base-reward u1000)
+        (calculated-reward (calculate-reputation-reward reputation-score base-reward))
+    )
+        (begin
+            (asserts! (var-get system-active) ERR_NOT_AUTHORIZED)
+            (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+            (asserts! (is-eq (get verification-status attestation) "pending") ERR_ALREADY_ACTIVATED)
+            (asserts! (validate-oracle-consensus profile-id) ERR_ORACLE_TIMEOUT)
+            (asserts! (<= calculated-reward (var-get total-flux-tokens)) ERR_INSUFFICIENT_FUNDS)
+            
+            ;; Update attestation status and reward
+            (map-set reputation-attestations
+                { attestation-id: attestation-id }
+                (merge attestation {
+                    verification-status: "verified",
+                    oracle-confirmations: (get-oracle-confirmations profile-id),
+                    reward-amount: calculated-reward
+                })
+            )
+            
+            ;; Transfer reward to verifier
+            (try! (as-contract (stx-transfer? calculated-reward tx-sender verifier)))
+            (var-set total-flux-tokens (- (var-get total-flux-tokens) calculated-reward))
+            
+            ;; Update verifier success rate
+            (update-verifier-success-rate verifier true)
+            
+            (ok calculated-reward)
+        )
+    )
+)
+
+(define-public (update-domain-resilience (domain-id uint) (verification-index uint) (skill-density uint) (historical-attestations uint) (average-validation-time uint) (growth-rate uint))
+    (let ((tessellation-score (calculate-tessellation-score verification-index skill-density historical-attestations)))
+        (begin
+            (asserts! (var-get system-active) ERR_NOT_AUTHORIZED)
+            (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+            (map-set domain-resilience-data
+                { domain-id: domain-id }
+                {
+                    verification-index: verification-index,
+                    skill-density: skill-density,
+                    historical-attestations: historical-attestations,
+                    average-validation-time: average-validation-time,
+                    growth-rate: growth-rate,
+                    tessellation-score: tessellation-score
+                }
+            )
+            (ok tessellation-score)
+        )
+    )
+)
+
+(define-public (slash-verifier-stake (verifier principal) (slash-amount uint))
+    (let ((verifier-data (unwrap! (map-get? certified-verifiers { verifier: verifier }) ERR_VERIFIER_NOT_CERTIFIED)))
+        (begin
+            (asserts! (var-get system-active) ERR_NOT_AUTHORIZED)
+            (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+            (asserts! (<= slash-amount (get stake-amount verifier-data)) ERR_INSUFFICIENT_FUNDS)
+            
+            ;; Update verifier stake
+            (map-set certified-verifiers
+                { verifier: verifier }
+                (merge verifier-data {
+                    stake-amount: (- (get stake-amount verifier-data) slash-amount)
+                })
+            )
+            
+            ;; Add slashed amount to flux token pool
+            (var-set total-flux-tokens (+ (var-get total-flux-tokens) slash-amount))
+            
+            ;; Update verifier success rate
+            (update-verifier-success-rate verifier false)
+            
+            (ok true)
+        )
+    )
+)
+
+(define-public (extend-verifier-certification (verifier principal) (extension-blocks uint))
+    (let ((verifier-data (unwrap! (map-get? certified-verifiers { verifier: verifier }) ERR_VERIFIER_NOT_CERTIFIED)))
+        (begin
+            (asserts! (var-get system-active) ERR_NOT_AUTHORIZED)
+            (asserts! (is-eq tx-sender verifier) ERR_NOT_AUTHORIZED)
+            (asserts! (>= (get success-rate verifier-data) u75) ERR_INVALID_THRESHOLD)
+            
+            (map-set certified-verifiers
+                { verifier: verifier }
+                (merge verifier-data {
+                    certification-expires: (+ (get certification-expires verifier-data) extension-blocks)
+                })
+            )
+            (ok true)
+        )
+    )
+)
+
+;; Read-only functions
+(define-read-only (get-skill-profile (profile-id uint))
+    (map-get? skill-profiles { profile-id: profile-id })
+)
+
+(define-read-only (get-verifier-info (verifier principal))
+    (map-get? certified-verifiers { verifier: verifier })
+)
+
+(define-read-only (get-reputation-attestation (attestation-id uint))
+    (map-get? reputation-attestations { attestation-id: attestation-id })
+)
+
+(define-read-only (get-proof-tessellation (tessellation-id uint))
+    (map-get? proof-tessellations { tessellation-id: tessellation-id })
+)
+
+(define-read-only (get-oracle-assessment (oracle principal) (profile-id uint))
+    (map-get? oracle-assessments { oracle-id: oracle, profile-id: profile-id })
+)
+
+(define-read-only (get-domain-resilience (domain-id uint))
+    (map-get? domain-resilience-data { domain-id: domain-id })
+)
+
+(define-read-only (get-system-status)
+    {
+        active: (var-get system-active),
+        total-profiles: (var-get profile-counter),
+        total-attestations: (var-get attestation-counter),
+        total-tessellations: (var-get tessellation-counter),
+        flux-tokens: (var-get total-flux-tokens),
+        global-reputation: (var-get global-reputation-level)
+    }
+)
+
+(define-read-only (calculate-verification-cost (profile-id uint) (fragments uint))
+    (match (map-get? skill-profiles { profile-id: profile-id })
+        profile 
+        (let ((base-cost u100))
+            (* base-cost (+ fragments (get proficiency-level profile)))
+        )
+        u0
+    )
+)
+
+(define-read-only (get-verifier-reputation (verifier principal))
+    (match (map-get? certified-verifiers { verifier: verifier })
+        verifier-data 
+        {
+            success-rate: (get success-rate verifier-data),
+            total-verifications: (get total-verifications verifier-data),
+            certification-level: (get certification-level verifier-data),
+            is-active: (> (get certification-expires verifier-data) block-height)
+        }
+        {
+            success-rate: u0,
+            total-verifications: u0,
+            certification-level: u0,
+            is-active: false
+        }
+    )
+)
